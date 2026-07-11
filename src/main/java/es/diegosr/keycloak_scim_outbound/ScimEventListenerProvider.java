@@ -128,7 +128,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     continue;
                 }
 
-                final ScimClient client = new ScimClient(base, token);
+                final ScimClient client = new ScimClient(base, token, get(t, CFG_LOOKUP_STRATEGY, LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
                 final OperationType op  = adminEvent.getOperationType();
                 final String debounceKey = "GM:" + realm.getId() + ":" + userId + ":" + groupId + ":" + op;
                 final long now = java.time.Instant.now().toEpochMilli();
@@ -179,8 +179,8 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                                         op, userId);
                             } else {
                                 boolean ok = switch (op) {
-                                    case CREATE -> client.patchGroup(scimGroupId.get(), ScimMapper.buildGroupMemberPatch("add", scimUserId.get()));
-                                    case DELETE -> client.patchGroup(scimGroupId.get(), ScimMapper.buildGroupMemberPatch("remove", scimUserId.get()));
+                                    case CREATE -> client.groups().patch(scimGroupId.get(), ScimMapper.buildGroupMemberPatch("add", scimUserId.get()));
+                                    case DELETE -> client.groups().patch(scimGroupId.get(), ScimMapper.buildGroupMemberPatch("remove", scimUserId.get()));
                                     default -> false;
                                 };
                                 logInfo("SCIM", t.getName(), "MEMBERSHIP %s user=%s group=%s -> %s",
@@ -242,7 +242,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 }
                 if (!"true".equalsIgnoreCase(get(t, CFG_SYNC_GROUPS, "false"))) continue;
                 if (!isGroupAllowedForSync(t, groupName)) continue;
-                final ScimClient client = new ScimClient(base, token);
+                final ScimClient client = new ScimClient(base, token, get(t, CFG_LOOKUP_STRATEGY, LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
                 try {
                     switch (op) {
                         case CREATE -> {
@@ -250,7 +250,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                                 logErr("SCIM", t.getName(), "GROUP CREATE: group not found (id=%s)", groupId);
                                 break;
                             }
-                            boolean ok = client.createGroup(ScimMapper.buildCreateGroup(groupName, groupId));
+                            boolean ok = client.groups().create(ScimMapper.buildCreateGroup(groupName, groupId));
                             logInfo("SCIM", t.getName(), "GROUP CREATE name=%s -> %s", groupName, ok ? "OK" : "CONFLICT/NO-OP");
                         }
                         case UPDATE -> {
@@ -260,17 +260,17 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                             }
                             final Optional<String> scimId = resolveScimGroupId(client, groupId, groupName);
                             if (scimId.isPresent()) {
-                                boolean ok = client.patchGroup(scimId.get(), ScimMapper.buildPatchGroupDisplayName(groupName));
+                                boolean ok = client.groups().patch(scimId.get(), ScimMapper.buildPatchGroupDisplayName(groupName));
                                 logInfo("SCIM", t.getName(), "GROUP UPDATE name=%s -> %s", groupName, ok ? "OK" : "FAILED");
                             } else {
-                                boolean ok = client.createGroup(ScimMapper.buildCreateGroup(groupName, groupId));
+                                boolean ok = client.groups().create(ScimMapper.buildCreateGroup(groupName, groupId));
                                 logInfo("SCIM", t.getName(), "GROUP UPDATE (upsert) name=%s -> %s", groupName, ok ? "OK" : "FAILED");
                             }
                         }
                         case DELETE -> {
-                            final Optional<String> scimId = client.findGroupIdByExternalId(groupId);
+                            final Optional<String> scimId = client.groups().resolveId(groupId, groupName);
                             if (scimId.isPresent()) {
-                                boolean ok = client.deleteGroup(scimId.get());
+                                boolean ok = client.groups().delete(scimId.get());
                                 logInfo("SCIM", t.getName(), "GROUP DELETE groupId=%s -> %s", groupId, ok ? "OK" : "FAILED");
                             } else {
                                 logInfo("SCIM", t.getName(), "GROUP DELETE groupId=%s -> NOT FOUND in SCIM", groupId);
@@ -332,7 +332,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             }
         }
 
-        ScimClient client = new ScimClient(base, token);
+        ScimClient client = new ScimClient(base, token, get(t, CFG_LOOKUP_STRATEGY, LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
 
         try {
             boolean changed = switch (action) {
@@ -385,14 +385,14 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         final String externalId = user.getId();
         var existingId = resolveScimId(scim, externalId, scimUserName);
         if (existingId.isEmpty()) {
-            boolean created = scim.createUser(ScimMapper.buildCreateUser(user, scimUserName));
+            boolean created = scim.users().create(ScimMapper.buildCreateUser(user, scimUserName));
             if (created) return true;
 
             // Creation failed (likely 409). Re-resolve and PATCH.
             existingId = resolveScimId(scim, externalId, scimUserName);
-            return existingId.map(id -> scim.patchUser(id, ScimMapper.buildPatchUser(user, externalId))).orElse(false);
+            return existingId.map(id -> scim.users().patch(id, ScimMapper.buildPatchUser(user, externalId))).orElse(false);
         } else {
-            return scim.patchUser(existingId.get(), ScimMapper.buildPatchUser(user, externalId));
+            return scim.users().patch(existingId.get(), ScimMapper.buildPatchUser(user, externalId));
         }
     }
 
@@ -414,13 +414,13 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         String effectiveMode = mode;
         boolean ok;
         if ("delete".equals(mode)) {
-            ok = scim.deleteUser(id.get());
+            ok = scim.users().delete(id.get());
         } else if ("deactivate".equals(mode)) {
-            ok = scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
+            ok = scim.users().patch(id.get(), ScimMapper.buildDeactivatePatch());
         } else {
             logErr("SCIM", t.getName(), "Invalid deprovisionAction=%s; falling back to deactivate", mode);
             effectiveMode = "deactivate";
-            ok = scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
+            ok = scim.users().patch(id.get(), ScimMapper.buildDeactivatePatch());
         }
         if (!ok) {
             throw new IllegalStateException(String.format(
@@ -459,24 +459,12 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     /** Prefer externalId lookup; fall back to displayName for groups. */
     private Optional<String> resolveScimGroupId(ScimClient scim, String externalId, String displayName) {
-        Optional<String> id = (externalId != null && !externalId.isBlank())
-                ? scim.findGroupIdByExternalId(externalId)
-                : Optional.empty();
-        if (id.isEmpty() && displayName != null && !displayName.isBlank()) {
-            id = scim.findGroupIdByDisplayName(displayName);
-        }
-        return id;
+        return scim.groups().resolveId(externalId, displayName);
     }
 
     /** Prefer externalId lookup; fall back to userName for legacy users without externalId. */
     private Optional<String> resolveScimId(ScimClient scim, String externalId, String scimUserName) {
-        Optional<String> id = (externalId != null && !externalId.isBlank())
-                ? scim.findUserIdByExternalId(externalId)
-                : Optional.empty();
-        if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
-            id = scim.findUserIdByUserName(scimUserName);
-        }
-        return id;
+        return scim.users().resolveId(externalId, scimUserName);
     }
 
     private static String extractUserId(String resourcePath) {
