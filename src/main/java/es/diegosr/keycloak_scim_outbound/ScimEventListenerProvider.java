@@ -87,12 +87,16 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             final RealmModel realm = session.realms().getRealm(adminEvent.getRealmId());
             if (realm == null) return;
 
-            final String raw = adminEvent.getResourcePath();
-            final String path = raw.startsWith("/") ? raw : "/" + raw;
+            final String raw = adminEvent.getResourcePath(); // e.g. "users/{uid}/groups/{gid}" or "groups/{gid}/members/{uid}"
+            final String path = raw.startsWith("/") ? raw : "/" + raw;  // normalize to leading slash
 
+            // Common path patterns:
+            //  - /users/{userId}/groups/{groupId}
+            //  - /groups/{groupId}/members/{userId}
             String userId  = extractSegmentAfter(path, "/users/");
             String groupId = extractSegmentAfter(path, "/groups/");
 
+            // fallback for "groups/{gid}/members/{uid}"
             if (userId == null)  userId  = extractSegmentAfter(path, "/members/");
             if (groupId == null) groupId = extractSegmentAfter(path, "/groups/");
 
@@ -111,6 +115,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 return;
             }
 
+            // For each SCIM target configured in this realm
             final List<ComponentModel> targets = realm.getComponentsStream()
                     .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
                     .toList();
@@ -123,8 +128,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     continue;
                 }
 
-                final ScimClient client = new ScimClient(base, token,
-                        get(t, CFG_LOOKUP_STRATEGY, LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
+                final ScimClient client = new ScimClient(base, token);
                 final OperationType op  = adminEvent.getOperationType();
                 final String debounceKey = "GM:" + realm.getId() + ":" + userId + ":" + groupId + ":" + op;
                 final long now = java.time.Instant.now().toEpochMilli();
@@ -133,6 +137,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
                 final String scimUserName = computeScimUserName(t, user, username);
 
+                // A) Filter-group user provisioning (existing behavior)
                 final String cfgGroup = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
                 if (cfgGroup != null && !cfgGroup.isBlank() && cfgGroup.equals(groupName)) {
                     if (scimUserName == null || scimUserName.isBlank()) {
@@ -140,12 +145,12 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     } else {
                         try {
                             switch (op) {
-                                case CREATE -> {
+                                case CREATE -> { // user ADDED to group
                                     boolean changed = upsertUser(client, user, scimUserName);
                                     logInfo("SCIM", t.getName(), "GROUP ADD user=%s group=%s -> %s",
                                             scimUserName, groupName, changed ? "OK" : "NO-OP");
                                 }
-                                case DELETE -> {
+                                case DELETE -> { // user REMOVED from group
                                     boolean changed = deprovisionUser(t, client, userId, scimUserName);
                                     logInfo("SCIM", t.getName(), "GROUP REMOVE user=%s group=%s -> %s",
                                             scimUserName, groupName, changed ? "OK" : "NO-OP");
@@ -159,6 +164,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     }
                 }
 
+                // B) Sync group membership in SCIM (only when syncGroups is explicitly enabled)
                 if ("true".equalsIgnoreCase(get(t, CFG_SYNC_GROUPS, "false"))
                         && isGroupAllowedForSync(t, groupName)) {
                     try {
@@ -173,10 +179,8 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                                         op, userId);
                             } else {
                                 boolean ok = switch (op) {
-                                    case CREATE -> client.groups().patch(scimGroupId.get(),
-                                            ScimMapper.buildGroupMemberPatch("add", scimUserId.get()));
-                                    case DELETE -> client.groups().patch(scimGroupId.get(),
-                                            ScimMapper.buildGroupMemberPatch("remove", scimUserId.get()));
+                                    case CREATE -> client.patchGroup(scimGroupId.get(), ScimMapper.buildGroupMemberPatch("add", scimUserId.get()));
+                                    case DELETE -> client.patchGroup(scimGroupId.get(), ScimMapper.buildGroupMemberPatch("remove", scimUserId.get()));
                                     default -> false;
                                 };
                                 logInfo("SCIM", t.getName(), "MEMBERSHIP %s user=%s group=%s -> %s",
@@ -188,9 +192,10 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     }
                 }
             }
-            return;
+            return; // membership handled
         }
 
+        // 2) USER CRUD EVENTS
         if (adminEvent.getResourceType() == ResourceType.USER) {
             final RealmModel realm = session.realms().getRealm(adminEvent.getRealmId());
             if (realm == null) return;
@@ -206,10 +211,11 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 case CREATE -> dispatch("CREATE", realm, userId, username, user, null);
                 case UPDATE -> dispatch("UPDATE", realm, userId, username, user, null);
                 case DELETE -> dispatch("DELETE", realm, userId, username, user, null);
-                default -> { }
+                default -> { /* ignore */ }
             }
         }
 
+        // 3) GROUP CRUD EVENTS
         if (adminEvent.getResourceType() == ResourceType.GROUP) {
             final RealmModel realm = session.realms().getRealm(adminEvent.getRealmId());
             if (realm == null) return;
@@ -236,8 +242,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 }
                 if (!"true".equalsIgnoreCase(get(t, CFG_SYNC_GROUPS, "false"))) continue;
                 if (!isGroupAllowedForSync(t, groupName)) continue;
-                final ScimClient client = new ScimClient(base, token,
-                        get(t, CFG_LOOKUP_STRATEGY, LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
+                final ScimClient client = new ScimClient(base, token);
                 try {
                     switch (op) {
                         case CREATE -> {
@@ -245,7 +250,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                                 logErr("SCIM", t.getName(), "GROUP CREATE: group not found (id=%s)", groupId);
                                 break;
                             }
-                            boolean ok = client.groups().create(ScimMapper.buildCreateGroup(groupName, groupId));
+                            boolean ok = client.createGroup(ScimMapper.buildCreateGroup(groupName, groupId));
                             logInfo("SCIM", t.getName(), "GROUP CREATE name=%s -> %s", groupName, ok ? "OK" : "CONFLICT/NO-OP");
                         }
                         case UPDATE -> {
@@ -255,17 +260,17 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                             }
                             final Optional<String> scimId = resolveScimGroupId(client, groupId, groupName);
                             if (scimId.isPresent()) {
-                                boolean ok = client.groups().patch(scimId.get(), ScimMapper.buildPatchGroupDisplayName(groupName));
+                                boolean ok = client.patchGroup(scimId.get(), ScimMapper.buildPatchGroupDisplayName(groupName));
                                 logInfo("SCIM", t.getName(), "GROUP UPDATE name=%s -> %s", groupName, ok ? "OK" : "FAILED");
                             } else {
-                                boolean ok = client.groups().create(ScimMapper.buildCreateGroup(groupName, groupId));
+                                boolean ok = client.createGroup(ScimMapper.buildCreateGroup(groupName, groupId));
                                 logInfo("SCIM", t.getName(), "GROUP UPDATE (upsert) name=%s -> %s", groupName, ok ? "OK" : "FAILED");
                             }
                         }
                         case DELETE -> {
-                            final Optional<String> scimId = resolveScimGroupId(client, groupId, groupName);
+                            final Optional<String> scimId = client.findGroupIdByExternalId(groupId);
                             if (scimId.isPresent()) {
-                                boolean ok = client.groups().delete(scimId.get());
+                                boolean ok = client.deleteGroup(scimId.get());
                                 logInfo("SCIM", t.getName(), "GROUP DELETE groupId=%s -> %s", groupId, ok ? "OK" : "FAILED");
                             } else {
                                 logInfo("SCIM", t.getName(), "GROUP DELETE groupId=%s -> NOT FOUND in SCIM", groupId);
@@ -278,9 +283,13 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 }
             }
         }
+        // other resource types -> ignore
     }
 
+    /* ===== Core dispatch ===== */
+
     private void dispatch(String action, RealmModel realm, String userId, String username, UserModel user, Map<String,String> details) {
+        // Debounce to reduce double delivery (user event + admin event)
         String key = realm.getId() + ":" + action + ":" + userId;
         long now = Instant.now().toEpochMilli();
         Long last = debounce.put(key, now);
@@ -323,8 +332,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             }
         }
 
-        ScimClient client = new ScimClient(base, token,
-                get(t, CFG_LOOKUP_STRATEGY, LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
+        ScimClient client = new ScimClient(base, token);
 
         try {
             boolean changed = switch (action) {
@@ -343,11 +351,12 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         }
     }
 
+    // Resolve SCIM userName from strategy
     private String computeScimUserName(ComponentModel t, UserModel user, String fallbackUsername) {
         String strategy = get(t, CFG_UNAME_STRATEGY, "username");
         logInfo("keycloak-scim-outbound", t.getName(), "Using userNameStrategy=%s", strategy);
 
-        if (user == null) return fallbackUsername;
+        if (user == null) return fallbackUsername; // best-effort on deletes
 
         switch (strategy) {
             case "username":
@@ -364,23 +373,35 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     private static String nullIfBlank(String s) { return (s == null || s.isBlank()) ? null : s; }
 
+    /**
+     * Returns true if we successfully created or patched the SCIM user.
+     * Prefers externalId for lookup (userName can change with the configured strategy),
+     * falling back to userName for users provisioned before externalId existed.
+     * The PATCH also sets externalId when missing, so legacy users get it on update.
+     */
     private boolean upsertUser(ScimClient scim, UserModel user, String scimUserName) {
         if (user == null) return false;
 
         final String externalId = user.getId();
         var existingId = resolveScimId(scim, externalId, scimUserName);
         if (existingId.isEmpty()) {
-            boolean created = scim.users().create(ScimMapper.buildCreateUser(user, scimUserName));
+            boolean created = scim.createUser(ScimMapper.buildCreateUser(user, scimUserName));
             if (created) return true;
 
+            // Creation failed (likely 409). Re-resolve and PATCH.
             existingId = resolveScimId(scim, externalId, scimUserName);
-            return existingId.map(id -> scim.users().patch(id,
-                    ScimMapper.buildPatchUser(user, externalId))).orElse(false);
+            return existingId.map(id -> scim.patchUser(id, ScimMapper.buildPatchUser(user, externalId))).orElse(false);
         } else {
-            return scim.users().patch(existingId.get(), ScimMapper.buildPatchUser(user, externalId));
+            return scim.patchUser(existingId.get(), ScimMapper.buildPatchUser(user, externalId));
         }
     }
 
+    /**
+     * Deprovision a user according to the target's configured behavior:
+     *  - "delete"     -> hard DELETE /Users/{id}
+     *  - "deactivate" -> PATCH active=false (default, documented behavior)
+     * Resolves the SCIM id by externalId first, then by userName as a fallback.
+     */
     private boolean deprovisionUser(ComponentModel t, ScimClient scim, String externalId, String scimUserName) {
         var id = resolveScimId(scim, externalId, scimUserName);
         if (id.isEmpty()) {
@@ -393,13 +414,13 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         String effectiveMode = mode;
         boolean ok;
         if ("delete".equals(mode)) {
-            ok = scim.users().delete(id.get());
+            ok = scim.deleteUser(id.get());
         } else if ("deactivate".equals(mode)) {
-            ok = scim.users().patch(id.get(), ScimMapper.buildDeactivatePatch());
+            ok = scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
         } else {
             logErr("SCIM", t.getName(), "Invalid deprovisionAction=%s; falling back to deactivate", mode);
             effectiveMode = "deactivate";
-            ok = scim.users().patch(id.get(), ScimMapper.buildDeactivatePatch());
+            ok = scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
         }
         if (!ok) {
             throw new IllegalStateException(String.format(
@@ -409,13 +430,24 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         return ok;
     }
 
+    /**
+     * Returns true if the group should be synced for this target.
+     *
+     * When CFG_SYNC_GROUPS_FILTER is blank: only the group named by CFG_FILTER_GROUP is in scope.
+     * When CFG_SYNC_GROUPS_FILTER is set: the group name must match the Java regex.
+     * groupName=null: returns true only when filter is set (so that DELETE events where the
+     * group is already gone can still be attempted by regex-configured targets), and false
+     * for the blank-filter case (no name to match against CFG_FILTER_GROUP).
+     */
     private boolean isGroupAllowedForSync(ComponentModel t, String groupName) {
         String filter = get(t, CFG_SYNC_GROUPS_FILTER, null);
         if (filter == null || filter.isBlank()) {
+            // No regex: only the CFG_FILTER_GROUP is in scope
             if (groupName == null) return false;
             String filterGroup = get(t, CFG_FILTER_GROUP, null);
             return groupName.equals(filterGroup);
         }
+        // Regex filter: null groupName passes so DELETE events are not silently dropped
         if (groupName == null) return true;
         try {
             return groupName.matches(filter);
@@ -425,12 +457,26 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         }
     }
 
+    /** Prefer externalId lookup; fall back to displayName for groups. */
     private Optional<String> resolveScimGroupId(ScimClient scim, String externalId, String displayName) {
-        return scim.groups().resolveId(externalId, displayName);
+        Optional<String> id = (externalId != null && !externalId.isBlank())
+                ? scim.findGroupIdByExternalId(externalId)
+                : Optional.empty();
+        if (id.isEmpty() && displayName != null && !displayName.isBlank()) {
+            id = scim.findGroupIdByDisplayName(displayName);
+        }
+        return id;
     }
 
+    /** Prefer externalId lookup; fall back to userName for legacy users without externalId. */
     private Optional<String> resolveScimId(ScimClient scim, String externalId, String scimUserName) {
-        return scim.users().resolveId(externalId, scimUserName);
+        Optional<String> id = (externalId != null && !externalId.isBlank())
+                ? scim.findUserIdByExternalId(externalId)
+                : Optional.empty();
+        if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
+            id = scim.findUserIdByUserName(scimUserName);
+        }
+        return id;
     }
 
     private static String extractUserId(String resourcePath) {
@@ -451,6 +497,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         return (end > i) ? path.substring(i, end) : path.substring(i);
     }
 
+    /* ===== timestamped logging helpers ===== */
     private static String now() { return java.time.OffsetDateTime.now().toString(); }
     private static void logInfo(String subsystem, String target, String fmt, Object... args) {
         System.out.printf("%s [keycloak-scim-outbound][%s%s] %s%n",
