@@ -96,7 +96,9 @@ public final class ScimGroupSync {
                 err("Target=%s incomplete config (baseUrl/token). Skipping group sync.", target.getName());
                 continue;
             }
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = new ScimClient(base, token, ScimTargetProviderFactory.get(target,
+                    ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
+                    ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
             String removeForm = ScimTargetProviderFactory.get(target,
                     ScimTargetProviderFactory.CFG_GROUP_MEMBER_REMOVE_FORM,
                     ScimMapper.REMOVE_FORM_RFC_PATH_FILTER);
@@ -161,7 +163,7 @@ public final class ScimGroupSync {
                         if (entry.state() == GroupMembershipState.State.NEW_ADDED) {
                             debug("Calling client.patchGroup(add) group=%s scimGroupId=%s userId=%s scimUserId=%s target=%s",
                                     group.getName(), scimGroupId.get(), entry.userId(), scimUserId.get(), target.getName());
-                            boolean ok = client.patchGroup(scimGroupId.get(),
+                            boolean ok = client.groups().patch(scimGroupId.get(),
                                     ScimMapper.buildGroupMemberPatch("add", scimUserId.get()));
                             if (ok) {
                                 updatedValues.remove(raw);
@@ -180,7 +182,7 @@ public final class ScimGroupSync {
                         } else if (entry.state() == GroupMembershipState.State.NEW_DELETED) {
                             debug("Calling client.patchGroup(remove) group=%s scimGroupId=%s userId=%s scimUserId=%s target=%s",
                                     group.getName(), scimGroupId.get(), entry.userId(), scimUserId.get(), target.getName());
-                            boolean ok = client.patchGroup(scimGroupId.get(),
+                            boolean ok = client.groups().patch(scimGroupId.get(),
                                     ScimMapper.buildGroupMemberPatch("remove", scimUserId.get(), removeForm));
                             if (ok) {
                                 updatedValues.remove(raw);
@@ -258,7 +260,9 @@ public final class ScimGroupSync {
                 err("Target=%s incomplete config (baseUrl/token). Skipping full group sync.", target.getName());
                 continue;
             }
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = new ScimClient(base, token, ScimTargetProviderFactory.get(target,
+                    ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
+                    ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
 
             List<GroupModel> inScopeGroups = resolveInScopeGroups(session, realm, target);
             debug("Target=%s: %d in-scope group(s) for full sync.", target.getName(), inScopeGroups.size());
@@ -304,11 +308,12 @@ public final class ScimGroupSync {
                 try {
                     debug("Calling client.patchGroup(replace) group=%s scimGroupId=%s target=%s members=%d",
                             group.getName(), scimGroupId.get(), target.getName(), scimMemberIds.size());
-                    boolean ok = client.patchGroup(scimGroupId.get(),
+                    boolean ok = client.groups().patch(scimGroupId.get(),
                             ScimMapper.buildGroupMemberReplace(scimMemberIds));
                     if (ok) {
                         info("FULL SYNC group=%s target=%s members=%d -> OK",
                                 group.getName(), target.getName(), scimMemberIds.size());
+                        markProvisioned(group, target.getId());
                         clearGroupState(group, target.getId());
                     } else {
                         failures++;
@@ -379,7 +384,7 @@ public final class ScimGroupSync {
             }
             String scimGroupId = scimGroupIdOpt.get();
 
-            List<String> remoteScimUserIds = client.getGroupMembers(scimGroupId);
+            List<String> remoteScimUserIds = client.groups().getMembers(group.getId(), group.getName());
             debug("crossCheck: group=%s scimGroupId=%s remote members=%d",
                     group.getName(), scimGroupId, remoteScimUserIds.size());
             if (remoteScimUserIds.isEmpty()) {
@@ -405,7 +410,7 @@ public final class ScimGroupSync {
                 debug("crossCheck: removing excess remote member scimUserId=%s from group=%s target=%s",
                         remoteId, group.getName(), target.getName());
                 try {
-                    boolean ok = client.patchGroup(scimGroupId,
+                    boolean ok = client.groups().patch(scimGroupId,
                             ScimMapper.buildGroupMemberPatch("remove", remoteId, removeForm));
                     if (ok) {
                         removedTotal++;
@@ -449,7 +454,6 @@ public final class ScimGroupSync {
      *      a. Resolve its SCIM group id via resolveScimGroupId (no upsert).
      *      b. If found remotely: send DELETE /Groups/{scimGroupId}.
      *         On success: call clearGroupState to remove KC attributes.
-     *         On failure: log ERROR; leave KC attributes intact (will retry next cycle).
      *      c. If not found remotely: the remote group is already gone. Call
      *         clearGroupState for housekeeping and log INFO.
      *
@@ -483,7 +487,9 @@ public final class ScimGroupSync {
                 err("Target=%s: incomplete config. Skipping deprovision sweep.", target.getName());
                 continue;
             }
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = new ScimClient(base, token, ScimTargetProviderFactory.get(target,
+                    ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
+                    ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST));
 
             // Step 1: find all KC groups that carry a GroupMembershipState entry for this target.
             // Full group-stream scan is acceptable: groups are few (tens to low hundreds).
@@ -491,13 +497,13 @@ public final class ScimGroupSync {
             List<GroupModel> previouslyProvisioned = session.groups()
                     .getGroupsStream(realm)
                     .filter(g -> {
-                        List<String> vals = g.getAttributeStream(
-                                GroupMembershipState.ATTRIBUTE_NAME).toList();
-                        return vals.stream()
-                                .map(GroupMembershipState::parse)
-                                .filter(Optional::isPresent)
-                                .map(Optional::get)
+                        boolean hasProvenance = g.getAttributeStream(
+                                GroupMembershipState.PROVISIONED_ATTRIBUTE_NAME)
+                                .anyMatch(GroupMembershipState.provisionedValue(target.getId())::equals);
+                        boolean hasLegacyState = g.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME)
+                                .map(GroupMembershipState::parse).filter(Optional::isPresent).map(Optional::get)
                                 .anyMatch(e -> e.componentId().equals(target.getId()));
+                        return hasProvenance || hasLegacyState;
                     })
                     .collect(Collectors.toList());
 
@@ -522,18 +528,18 @@ public final class ScimGroupSync {
                     info("Target=%s: SCIM group for KC group '%s' (id=%s) not found remotely. "
                             + "Cleaning up KC attributes only.",
                             target.getName(), group.getName(), group.getId());
-                    clearGroupState(group, target.getId());
+                    clearAllGroupBookkeeping(group, target.getId());
                     continue;
                 }
 
                 debug("Calling client.deleteGroup scimGroupId=%s group='%s' target=%s",
                         scimGroupId.get(), group.getName(), target.getName());
                 try {
-                    boolean ok = client.deleteGroup(scimGroupId.get());
+                    boolean ok = client.groups().delete(scimGroupId.get());
                     if (ok) {
                         info("DEPROVISIONED group='%s' scimGroupId=%s target=%s -> DELETE OK",
                                 group.getName(), scimGroupId.get(), target.getName());
-                        clearGroupState(group, target.getId());
+                        clearAllGroupBookkeeping(group, target.getId());
                     } else {
                         err("DEPROVISION FAILED group='%s' scimGroupId=%s target=%s. Will retry next cycle.",
                                 group.getName(), scimGroupId.get(), target.getName());
@@ -581,7 +587,7 @@ public final class ScimGroupSync {
         String payload = ScimMapper.buildCreateGroup(group.getName(), group.getId());
         debug("Calling client.createGroup group=%s target=%s payload=%s",
                 group.getName(), target.getName(), payload);
-        boolean created = client.createGroup(payload);
+        boolean created = client.groups().create(payload);
         if (!created) {
             err("Target=%s: Failed to auto-create SCIM group for KC group '%s' (id=%s). Skipping.",
                     target.getName(), group.getName(), group.getId());
@@ -596,6 +602,7 @@ public final class ScimGroupSync {
         } else {
             info("Target=%s: Auto-created SCIM group '%s' -> scimGroupId=%s",
                     target.getName(), group.getName(), scimGroupId.get());
+            markProvisioned(group, target.getId());
         }
         return scimGroupId;
     }
@@ -637,97 +644,16 @@ public final class ScimGroupSync {
                 .toList();
     }
 
-    /**
-     * Resolve the SCIM group id for a Keycloak group.
-     *
-     * Behaviour is governed by CFG_LOOKUP_STRATEGY on the given target:
-     *
-     *   "externalId first" (default):
-     *     1. Query by externalId. If exactly one result is returned, use it.
-     *     2. If zero results: not found by externalId, fall through to displayName.
-     *     3. If more than one result: ambiguous (server-side data issue). Do not pick an
-     *        arbitrary match -- fall back to displayName and log a warning.
-     *
-     *   "name only":
-     *     Skip the externalId HTTP call entirely. Go straight to displayName lookup.
-     *     Use this when the SCIM server ignores the externalId filter.
-     */
+    /** Resolves a group identifier using the client resource lookup policy. */
     private static Optional<String> resolveScimGroupId(ScimClient client, ComponentModel target,
                                                         String externalId, String displayName) {
-        debug("resolveScimGroupId CALL externalId=%s displayName=%s", externalId, displayName);
-
-        String strategy = ScimTargetProviderFactory.get(target,
-                ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
-                ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST);
-
-        Optional<String> id = Optional.empty();
-
-        if (!ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)
-                && externalId != null && !externalId.isBlank()) {
-            ScimClient.ScimLookupResult r = client.findGroupByExternalId(externalId);
-            if (r.totalResults() == 1) {
-                id = r.id();
-            } else if (r.totalResults() > 1) {
-                debug("resolveScimGroupId: externalId=%s returned %d results (ambiguous), falling back to displayName",
-                        externalId, r.totalResults());
-            }
-            // totalResults == 0: not found, fall through to displayName
-        }
-
-        if (id.isEmpty() && displayName != null && !displayName.isBlank()) {
-            if (ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)) {
-                debug("resolveScimGroupId: strategy=name only, going straight to displayName=%s", displayName);
-            } else {
-                debug("resolveScimGroupId: externalId lookup empty, falling back to displayName=%s", displayName);
-            }
-            id = client.findGroupIdByDisplayName(displayName);
-        }
-
-        debug("resolveScimGroupId RESULT externalId=%s displayName=%s strategy=%s -> %s",
-                externalId, displayName, strategy, id.orElse("<none>"));
-        return id;
+        return client.groups().resolveId(externalId, displayName);
     }
 
-    /**
-     * Resolve the SCIM user id for a Keycloak user.
-     *
-     * Behaviour is governed by CFG_LOOKUP_STRATEGY on the given target:
-     *
-     *   "externalId first" (default):
-     *     1. Query by externalId. If exactly one result is returned, use it.
-     *     2. If the result is empty or ambiguous (totalResults != 1), fall back to userName.
-     *
-     *   "name only":
-     *     Skip the externalId HTTP call entirely. Go straight to userName lookup.
-     *     Use this when the SCIM server ignores the externalId filter.
-     */
+    /** Resolves a user identifier using the client resource lookup policy. */
     private static Optional<String> resolveScimUserId(ScimClient client, ComponentModel target,
                                                        String externalId, String scimUserName) {
-        debug("resolveScimUserId CALL externalId=%s scimUserName=%s", externalId, scimUserName);
-
-        String strategy = ScimTargetProviderFactory.get(target,
-                ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
-                ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST);
-
-        Optional<String> id = Optional.empty();
-
-        if (!ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)
-                && externalId != null && !externalId.isBlank()) {
-            id = client.findUserIdByExternalId(externalId);
-        }
-
-        if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
-            if (ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)) {
-                debug("resolveScimUserId: strategy=name only, going straight to userName=%s", scimUserName);
-            } else {
-                debug("resolveScimUserId: externalId lookup empty, falling back to userName=%s", scimUserName);
-            }
-            id = client.findUserIdByUserName(scimUserName);
-        }
-
-        debug("resolveScimUserId RESULT externalId=%s scimUserName=%s strategy=%s -> %s",
-                externalId, scimUserName, strategy, id.orElse("<none>"));
-        return id;
+        return client.users().resolveId(externalId, scimUserName);
     }
 
     private static String computeScimUserName(ComponentModel t, UserModel user) {
@@ -771,8 +697,27 @@ public final class ScimGroupSync {
 
         group.setAttribute(GroupMembershipState.ATTRIBUTE_NAME, updatedValues);
         group.setAttribute(GroupMembershipState.PENDING_ATTRIBUTE_NAME, allPending);
+        markProvisioned(group, componentId);
         debug("Updated group state for group=%s componentId=%s -> membershipState=%s pending=%s",
                 group.getName(), componentId, updatedValues, allPending);
+    }
+
+    private static void markProvisioned(GroupModel group, String componentId) {
+        List<String> values = new ArrayList<>(group.getAttributeStream(
+                GroupMembershipState.PROVISIONED_ATTRIBUTE_NAME).toList());
+        String marker = GroupMembershipState.provisionedValue(componentId);
+        if (!values.contains(marker)) {
+            values.add(marker);
+            group.setAttribute(GroupMembershipState.PROVISIONED_ATTRIBUTE_NAME, values);
+        }
+    }
+
+    private static void clearAllGroupBookkeeping(GroupModel group, String componentId) {
+        clearGroupState(group, componentId);
+        List<String> provenance = new ArrayList<>(group.getAttributeStream(
+                GroupMembershipState.PROVISIONED_ATTRIBUTE_NAME).toList());
+        provenance.remove(GroupMembershipState.provisionedValue(componentId));
+        group.setAttribute(GroupMembershipState.PROVISIONED_ATTRIBUTE_NAME, provenance);
     }
 
     /**
