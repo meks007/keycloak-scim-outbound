@@ -363,18 +363,9 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                                            List<String> stateValues, List<String> pendingValues) {
         UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session).getUserById(realm, user.getId());
         if (localUser == null) {
-            // Fallback: could not resolve a local storage reference (should not normally
-            // happen since the user must already be imported locally to be enumerated
-            // here). Try the delegate directly as a last resort; if the store really is
-            // read-only this will throw, and we at least log why.
-            info("Could not resolve local storage user for id=%s (username=%s); attempting direct setAttribute as fallback.",
+            err("Could not resolve local storage user for id=%s (username=%s). "
+                            + "Bookkeeping attributes were not written and will be retried.",
                     user.getId(), user.getUsername());
-            user.setAttribute(MembershipState.ATTRIBUTE_NAME, stateValues);
-            user.setAttribute(MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues);
-            info("Persisted attributes '%s'=%s and '%s'=%s for user=%s (via federated delegate fallback)",
-                    MembershipState.ATTRIBUTE_NAME, stateValues,
-                    MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues,
-                    user.getUsername());
             return;
         }
         localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, stateValues);
