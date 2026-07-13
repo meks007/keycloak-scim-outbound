@@ -317,20 +317,54 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
     /**
      * Returns the list of in-scope groups for the given target.
+     *
      * When CFG_SYNC_GROUPS_FILTER is blank: only the group named by CFG_FILTER_GROUP.
-     * When CFG_SYNC_GROUPS_FILTER is set: all realm groups whose name matches the regex.
+     *
+     * When CFG_SYNC_GROUPS_FILTER_REGEX is false (default):
+     *   CFG_SYNC_GROUPS_FILTER is treated as a comma-separated list of exact group names.
+     *
+     * When CFG_SYNC_GROUPS_FILTER_REGEX is true:
+     *   CFG_SYNC_GROUPS_FILTER is treated as a Java regex applied to each group name.
+     *   PatternSyntaxException is caught and logged as ERROR, returning false for that group.
      */
     private List<GroupModel> resolveInScopeGroups(RealmModel realm, ComponentModel target) {
-        String filter = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_SYNC_GROUPS_FILTER, null);
+        String filter = ScimTargetProviderFactory.get(
+                target, ScimTargetProviderFactory.CFG_SYNC_GROUPS_FILTER, null);
+        boolean useRegex = "true".equalsIgnoreCase(ScimTargetProviderFactory.get(
+                target, ScimTargetProviderFactory.CFG_SYNC_GROUPS_FILTER_REGEX, "false"));
+
         if (filter == null || filter.isBlank()) {
-            String filterGroupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+            String filterGroupName = ScimTargetProviderFactory.get(
+                    target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
             if (filterGroupName == null || filterGroupName.isBlank()) return List.of();
             return session.groups().searchForGroupByNameStream(realm, filterGroupName, true, null, null)
                     .collect(Collectors.toList());
         }
-        return session.groups().getGroupsStream(realm)
-                .filter(g -> g.getName() != null && g.getName().matches(filter))
-                .collect(Collectors.toList());
+
+        if (useRegex) {
+            return session.groups().getGroupsStream(realm)
+                    .filter(g -> {
+                        try {
+                            return g.getName() != null && g.getName().matches(filter);
+                        } catch (java.util.regex.PatternSyntaxException e) {
+                            err("Invalid CFG_SYNC_GROUPS_FILTER regex '%s': %s", filter, e.getMessage());
+                            return false;
+                        }
+                    })
+                    .collect(Collectors.toList());
+        }
+
+        // Default: comma-separated list of exact group names.
+        List<GroupModel> result = new ArrayList<>();
+        for (String part : filter.split(",")) {
+            String name = part.trim();
+            if (!name.isEmpty()) {
+                session.groups()
+                        .searchForGroupByNameStream(realm, name, true, null, null)
+                        .forEach(result::add);
+            }
+        }
+        return result;
     }
 
     /**
