@@ -551,7 +551,10 @@ public final class ScimGroupSync {
      * GroupMembershipState attribute entry for this target's componentId. Groups created
      * in SCIM by other means (no KC state attributes) are never touched.
      *
-     * clearGroupState is called here -- and ONLY here -- after a successful remote DELETE.
+     * clearGroupState is called here -- and ONLY here -- after a successful remote DELETE,
+     * or when the remote group is confirmed NOT_FOUND (outcome == NOT_FOUND from the
+     * lookup). It is NOT called when the lookup returns ERROR or AMBIGUOUS, because
+     * those outcomes do not confirm the group is absent and clearing state would be unsafe.
      *
      * @param componentIdFilter always non-null in practice (runSweep passes model.getId()).
      */
@@ -605,31 +608,49 @@ public final class ScimGroupSync {
             LOG.debugf("Target=%s: %d out-of-scope group(s) to deprovision.", target.getName(), outOfScope.size());
 
             for (GroupModel group : outOfScope) {
-                Optional<String> scimGroupId = resolveScimGroupId(
-                        client, target, group.getId(), group.getName());
+                ScimGroupLookup lookup = resolveScimGroupIdWithOutcome(client, target, group.getId(), group.getName());
 
-                if (scimGroupId.isEmpty()) {
-                    LOG.infof("Target=%s: SCIM group for KC group '%s' (id=%s) not found remotely. "
+                if (lookup.outcome() == ScimGroupLookup.Outcome.ERROR) {
+                    // Transient failure: do not clear KC state. Will retry next cycle.
+                    LOG.errorf("Target=%s: lookup failed (ERROR) for KC group '%s' (id=%s). "
+                            + "Skipping deprovision to avoid unsafe state clear.",
+                            target.getName(), group.getName(), group.getId());
+                    continue;
+                }
+
+                if (lookup.outcome() == ScimGroupLookup.Outcome.AMBIGUOUS) {
+                    // Multiple remote matches: cannot safely identify which one to delete.
+                    LOG.errorf("Target=%s: lookup returned AMBIGUOUS for KC group '%s' (id=%s). "
+                            + "Skipping deprovision -- manual resolution required.",
+                            target.getName(), group.getName(), group.getId());
+                    continue;
+                }
+
+                if (lookup.outcome() == ScimGroupLookup.Outcome.NOT_FOUND) {
+                    // Confirmed zero results: group is already gone remotely.
+                    LOG.infof("Target=%s: SCIM group for KC group '%s' (id=%s) confirmed not found remotely. "
                             + "Cleaning up KC attributes only.",
                             target.getName(), group.getName(), group.getId());
                     clearGroupState(group, target.getId());
                     continue;
                 }
 
+                // FOUND: proceed with remote DELETE.
+                String scimGroupId = lookup.id().get();
                 try {
-                    boolean ok = client.deleteGroup(scimGroupId.get());
+                    boolean ok = client.deleteGroup(scimGroupId);
                     if (ok) {
                         LOG.infof("DEPROVISIONED group='%s' scimGroupId=%s target=%s -> DELETE OK",
-                                group.getName(), scimGroupId.get(), target.getName());
+                                group.getName(), scimGroupId, target.getName());
                         // clearGroupState called ONLY here, after a confirmed remote DELETE.
                         clearGroupState(group, target.getId());
                     } else {
                         LOG.errorf("DEPROVISION FAILED group='%s' scimGroupId=%s target=%s. Will retry next cycle.",
-                                group.getName(), scimGroupId.get(), target.getName());
+                                group.getName(), scimGroupId, target.getName());
                     }
                 } catch (Exception e) {
                     LOG.errorf("DEPROVISION EXCEPTION group='%s' scimGroupId=%s target=%s: %s",
-                            group.getName(), scimGroupId.get(), target.getName(), e.getMessage());
+                            group.getName(), scimGroupId, target.getName(), e.getMessage());
                 }
             }
         }
@@ -778,7 +799,62 @@ public final class ScimGroupSync {
     }
 
     /**
+     * Internal record used by resolveScimGroupIdWithOutcome to carry both the outcome
+     * and the resolved id (present only when outcome is FOUND).
+     */
+    private record ScimGroupLookup(Outcome outcome, Optional<String> id) {
+        enum Outcome { FOUND, NOT_FOUND, AMBIGUOUS, ERROR }
+    }
+
+    /**
+     * Resolve the SCIM group id for a Keycloak group, returning a ScimGroupLookup that
+     * distinguishes FOUND, NOT_FOUND, AMBIGUOUS, and ERROR outcomes.
+     *
+     * Used by deprovisionOutOfScopeGroups, which must not clear KC state on ERROR.
+     *
+     * Governed by CFG_LOOKUP_STRATEGY:
+     *   "externalId first" (default): try externalId via findGroupByExternalId;
+     *     on ERROR abort immediately (do not fall through to displayName);
+     *     on AMBIGUOUS or NOT_FOUND fall through to displayName.
+     *   "name only": skip the externalId HTTP call; go straight to displayName.
+     */
+    private static ScimGroupLookup resolveScimGroupIdWithOutcome(ScimClient client, ComponentModel target,
+                                                                   String externalId, String displayName) {
+        String strategy = ScimTargetProviderFactory.get(target,
+                ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
+                ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST);
+
+        if (!ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)
+                && externalId != null && !externalId.isBlank()) {
+            ScimClient.ScimLookupResult r = client.findGroupByExternalId(externalId);
+            if (r.outcome() == ScimClient.LookupOutcome.FOUND) {
+                return new ScimGroupLookup(ScimGroupLookup.Outcome.FOUND, r.id());
+            }
+            if (r.outcome() == ScimClient.LookupOutcome.ERROR) {
+                // Propagate error immediately -- do not mask it with a displayName fallback.
+                return new ScimGroupLookup(ScimGroupLookup.Outcome.ERROR, Optional.empty());
+            }
+            // NOT_FOUND or AMBIGUOUS: fall through to displayName lookup.
+            if (r.outcome() == ScimClient.LookupOutcome.AMBIGUOUS) {
+                LOG.debugf("resolveScimGroupIdWithOutcome: externalId=%s returned AMBIGUOUS, "
+                        + "falling back to displayName", externalId);
+            }
+        }
+
+        if (displayName != null && !displayName.isBlank()) {
+            Optional<String> id = client.findGroupIdByDisplayName(displayName);
+            if (id.isPresent()) {
+                return new ScimGroupLookup(ScimGroupLookup.Outcome.FOUND, id);
+            }
+        }
+
+        return new ScimGroupLookup(ScimGroupLookup.Outcome.NOT_FOUND, Optional.empty());
+    }
+
+    /**
      * Resolve the SCIM group id for a Keycloak group.
+     * Returns Optional.empty() for NOT_FOUND, AMBIGUOUS, or ERROR outcomes.
+     * Used by paths that already handle an empty result safely (upsert, cross-check).
      *
      * Governed by CFG_LOOKUP_STRATEGY:
      *   "externalId first" (default): try externalId; if zero or ambiguous, fall back to displayName.
@@ -795,12 +871,14 @@ public final class ScimGroupSync {
         if (!ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)
                 && externalId != null && !externalId.isBlank()) {
             ScimClient.ScimLookupResult r = client.findGroupByExternalId(externalId);
-            if (r.totalResults() == 1) {
+            if (r.outcome() == ScimClient.LookupOutcome.FOUND) {
                 id = r.id();
-            } else if (r.totalResults() > 1) {
-                LOG.debugf("resolveScimGroupId: externalId=%s returned %d results (ambiguous), "
-                        + "falling back to displayName", externalId, r.totalResults());
+            } else if (r.outcome() == ScimClient.LookupOutcome.AMBIGUOUS) {
+                LOG.debugf("resolveScimGroupId: externalId=%s returned AMBIGUOUS, "
+                        + "falling back to displayName", externalId);
             }
+            // ERROR: fall through to displayName so upsert/cross-check can still attempt
+            // a name-based lookup; both callers treat an empty final result as a safe skip.
         }
 
         if (id.isEmpty() && displayName != null && !displayName.isBlank()) {
@@ -886,8 +964,9 @@ public final class ScimGroupSync {
 
     /**
      * Removes all GroupMembershipState and pending attribute entries for the given target.
-     * Called ONLY from deprovisionOutOfScopeGroups after a confirmed remote DELETE.
-     * Must NOT be called from any sync path.
+     * Called ONLY from deprovisionOutOfScopeGroups after a confirmed remote DELETE or a
+     * confirmed NOT_FOUND (zero-result) response.
+     * Must NOT be called from any sync path or on ERROR/AMBIGUOUS lookup outcomes.
      */
     private static void clearGroupState(GroupModel group, String componentId) {
         List<String> currentState = group.getAttributeStream(
