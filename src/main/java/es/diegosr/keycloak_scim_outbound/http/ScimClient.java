@@ -192,7 +192,14 @@ public class ScimClient {
     // Groups
     // =========================================================================
 
-    /** Find group by displayName and return the SCIM id if present. */
+    /**
+     * Find group by displayName and return the SCIM id if exactly one result is found.
+     *
+     * Returns empty when the server returns zero results, more than one result, a
+     * non-2xx status, or throws. Callers must not assume that an empty result means
+     * the group does not exist -- it may also indicate a transient error or an
+     * ambiguous match.
+     */
     public Optional<String> findGroupIdByDisplayName(String displayName) {
         return findGroupIdByFilter("displayName", displayName, "findGroupIdByDisplayName");
     }
@@ -203,17 +210,41 @@ public class ScimClient {
     }
 
     /**
-     * Find group by externalId and return both the id and the raw totalResults count.
+     * Outcome of a group lookup that must distinguish four states:
      *
-     * Callers that need to distinguish "not found" from "ambiguous" (totalResults > 1)
-     * should use this method instead of findGroupIdByExternalId. A UUID-based externalId
-     * should always yield exactly one result; more than one indicates a server-side data
-     * issue and the caller should fall back to a displayName lookup rather than picking
-     * an arbitrary match.
+     *   FOUND     -- exactly one remote group matched; id is present.
+     *   NOT_FOUND -- server returned 2xx with totalResults == 0; id is empty.
+     *   AMBIGUOUS -- server returned 2xx with totalResults > 1; id is empty.
+     *                Caller should fall back to a displayName lookup rather than
+     *                picking an arbitrary match.
+     *   ERROR     -- non-2xx response, network failure, timeout, or JSON parse
+     *                error. id is empty. Callers must NOT treat this as NOT_FOUND;
+     *                a transient error must never trigger duplicate creation or
+     *                lifecycle-state clearing.
+     */
+    public enum LookupOutcome { FOUND, NOT_FOUND, AMBIGUOUS, ERROR }
+
+    /**
+     * Result of findGroupByExternalId.
+     * outcome() is always set; id() is present only when outcome() == FOUND.
+     */
+    public record ScimLookupResult(LookupOutcome outcome, Optional<String> id) {
+        /** Convenience: true only when outcome is FOUND and an id is present. */
+        public boolean isFound() { return outcome == LookupOutcome.FOUND && id.isPresent(); }
+    }
+
+    /**
+     * Find group by externalId and return a ScimLookupResult that distinguishes
+     * FOUND, NOT_FOUND, AMBIGUOUS, and ERROR outcomes.
+     *
+     * Callers must check outcome() before using id(). In particular:
+     *   - ERROR must abort the current operation; do not fall through to displayName.
+     *   - AMBIGUOUS may fall through to a displayName lookup.
+     *   - NOT_FOUND may fall through to a displayName lookup.
      */
     public ScimLookupResult findGroupByExternalId(String externalId) {
         if (externalId == null || externalId.isBlank()) {
-            return new ScimLookupResult(Optional.empty(), 0);
+            return new ScimLookupResult(LookupOutcome.NOT_FOUND, Optional.empty());
         }
         try {
             String filter = "externalId eq " + scimFilterString(externalId);
@@ -227,24 +258,39 @@ public class ScimClient {
             if (is2xx(res.statusCode())) {
                 ScimListResponse groups = parseListResponse(res.body());
                 LOG.infof("GET /Groups?%s -> %d totalResults=%d", query, res.statusCode(), groups.totalResults());
-                // Only return the id when exactly one result is found; multiple results
-                // are ambiguous and the caller must fall back to a displayName lookup.
+
                 if (groups.totalResults() == 1 && groups.firstId().isPresent()) {
-                    return new ScimLookupResult(groups.firstId(), 1);
+                    return new ScimLookupResult(LookupOutcome.FOUND, groups.firstId());
                 }
-                return new ScimLookupResult(Optional.empty(), groups.totalResults());
+                if (groups.totalResults() > 1) {
+                    LOG.warnf("findGroupByExternalId: totalResults=%d for externalId=%s -- "
+                            + "ambiguous; caller should fall back to displayName lookup",
+                            groups.totalResults(), externalId);
+                    return new ScimLookupResult(LookupOutcome.AMBIGUOUS, Optional.empty());
+                }
+                return new ScimLookupResult(LookupOutcome.NOT_FOUND, Optional.empty());
             } else {
                 LOG.errorf("GET /Groups?%s -> %d %s", query, res.statusCode(), safeBody(res));
             }
         } catch (Exception e) {
             LOG.errorf("findGroupByExternalId failed: %s", e.getMessage());
         }
-        return new ScimLookupResult(Optional.empty(), 0);
+        return new ScimLookupResult(LookupOutcome.ERROR, Optional.empty());
     }
 
-    /** Result type for group lookups that need to expose totalResults alongside the id. */
-    public record ScimLookupResult(Optional<String> id, int totalResults) {}
-
+    /**
+     * Find group by the given filter attribute and return the SCIM id only when
+     * exactly one result is returned by the server.
+     *
+     * Returns empty when:
+     *   - totalResults == 0 (not found)
+     *   - totalResults > 1 (ambiguous -- picking Resources[0] would be wrong)
+     *   - non-2xx response or exception
+     *
+     * This strict single-result requirement applies to the displayName fallback
+     * as well: a server that returns multiple groups for a displayName filter
+     * must not have an arbitrary one selected.
+     */
     private Optional<String> findGroupIdByFilter(String attribute, String value, String operation) {
         if (value == null || value.isBlank()) return Optional.empty();
         try {
@@ -259,7 +305,14 @@ public class ScimClient {
             if (is2xx(res.statusCode())) {
                 ScimListResponse groups = parseListResponse(res.body());
                 LOG.infof("GET /Groups?%s -> %d totalResults=%d", query, res.statusCode(), groups.totalResults());
-                return groups.firstId();
+                if (groups.totalResults() == 1 && groups.firstId().isPresent()) {
+                    return groups.firstId();
+                }
+                if (groups.totalResults() > 1) {
+                    LOG.warnf("%s: totalResults=%d for %s=%s -- ambiguous, treating as miss",
+                            operation, groups.totalResults(), attribute, value);
+                }
+                return Optional.empty();
             } else {
                 LOG.errorf("GET /Groups?%s -> %d %s", query, res.statusCode(), safeBody(res));
             }
