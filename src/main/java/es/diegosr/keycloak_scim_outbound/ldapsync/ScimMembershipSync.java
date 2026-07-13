@@ -225,7 +225,7 @@ public final class ScimMembershipSync {
 
     /**
      * Full user sync: re-provision all current members of CFG_FILTER_GROUP and deprovision
-     * any users who were previously SENT but are no longer in scope.
+     * any users who were previously provisioned but are no longer in scope.
      *
      * STATE INVARIANT: MembershipState attributes survive this call.
      *   - Successful upsert  -> entry transitioned to SENT.
@@ -316,14 +316,39 @@ public final class ScimMembershipSync {
                 }
             }
 
+            // Build the set of users to deprovision: those who are no longer in the filter
+            // group but still have a tracked state entry for this target/group pair.
+            //
+            // Previously this searched only for the exact SENT attribute value. That missed
+            // users whose entry had already been transitioned to NEW_DELETED by
+            // LdapSyncNotifierMapper running earlier in the same "Synchronize all users"
+            // sweep -- the exact-value search returned nothing for them and the deprovision
+            // was silently skipped.
+            //
+            // Fix (Option A -- minimal change): issue a second search for NEW_DELETED and
+            // merge both result sets via putIfAbsent. The existing removeUserStateEntry
+            // helper removes the entry regardless of its current state, so the success path
+            // needs no change. On failure the entry is left untouched, satisfying the
+            // retry-on-failure invariant.
+            UserProvider local = localStorageFactory.apply(session);
+
             String sentValue = new MembershipState(
                     target.getId(), filterGroup.getId(), MembershipState.State.SENT).toValue();
-            List<UserModel> previouslyProvisioned = localStorageFactory.apply(session)
-                    .searchForUserByUserAttributeStream(realm, MembershipState.ATTRIBUTE_NAME, sentValue)
-                    .filter(u -> !currentMembers.containsKey(u.getId()))
-                    .collect(Collectors.toList());
+            String newDeletedValue = new MembershipState(
+                    target.getId(), filterGroup.getId(), MembershipState.State.NEW_DELETED).toValue();
 
-            LOG.debugf("Target=%s: %d previously-SENT user(s) no longer in filter group.",
+            Map<String, UserModel> deprovisionCandidates = new LinkedHashMap<>();
+            local.searchForUserByUserAttributeStream(realm, MembershipState.ATTRIBUTE_NAME, sentValue)
+                    .filter(u -> !currentMembers.containsKey(u.getId()))
+                    .forEach(u -> deprovisionCandidates.putIfAbsent(u.getId(), u));
+            // Also catch users whose entry is already NEW_DELETED (mapper ran before full sync).
+            local.searchForUserByUserAttributeStream(realm, MembershipState.ATTRIBUTE_NAME, newDeletedValue)
+                    .filter(u -> !currentMembers.containsKey(u.getId()))
+                    .forEach(u -> deprovisionCandidates.putIfAbsent(u.getId(), u));
+
+            List<UserModel> previouslyProvisioned = new ArrayList<>(deprovisionCandidates.values());
+
+            LOG.debugf("Target=%s: %d previously-provisioned user(s) no longer in filter group (SENT + NEW_DELETED).",
                     target.getName(), previouslyProvisioned.size());
 
             for (UserModel user : previouslyProvisioned) {
