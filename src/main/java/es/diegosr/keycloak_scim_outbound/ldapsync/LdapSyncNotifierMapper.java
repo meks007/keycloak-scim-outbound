@@ -1,6 +1,7 @@
 package es.diegosr.keycloak_scim_outbound.ldapsync;
 
 import es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory;
+import org.jboss.logging.Logger;
 import org.keycloak.component.ComponentModel;
 import org.keycloak.models.GroupModel;
 import org.keycloak.models.KeycloakSession;
@@ -76,7 +77,7 @@ import java.util.stream.Collectors;
  */
 public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
-    private static final String LOG_TAG = "[keycloak-scim-outbound/LDAP-SYNC-MAPPER]";
+    private static final Logger LOG = Logger.getLogger(LdapSyncNotifierMapper.class);
 
     private final KeycloakSession session;
     private final ComponentModel model;
@@ -88,7 +89,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
     @Override
     public void onImportUserFromLDAP(LDAPObject ldapUser, UserModel user, RealmModel realm, boolean isCreate) {
-        debug("onImportUserFromLDAP fired: user=%s isCreate=%s realm=%s", user.getUsername(), isCreate, realm.getName());
+        LOG.debugf("onImportUserFromLDAP fired: user=%s isCreate=%s realm=%s", user.getUsername(), isCreate, realm.getName());
         checkAndUpdateMembership(realm, user);
     }
 
@@ -103,7 +104,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                 .toList();
 
         if (scimTargets.isEmpty()) {
-            debug("No SCIM outbound targets configured in realm=%s. Nothing to do for user=%s.",
+            LOG.debugf("No SCIM outbound targets configured in realm=%s. Nothing to do for user=%s.",
                     realm.getName(), user.getUsername());
             return;
         }
@@ -115,7 +116,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
         for (ComponentModel target : scimTargets) {
             String groupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
             if (groupName == null || groupName.isBlank()) {
-                debug("Target=%s has no CFG_FILTER_GROUP configured. Skipping for user=%s.",
+                LOG.debugf("Target=%s has no CFG_FILTER_GROUP configured. Skipping for user=%s.",
                         target.getName(), user.getUsername());
                 continue;
             }
@@ -125,7 +126,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                     .searchForGroupByNameStream(realm, groupName, true, null, null)
                     .findFirst();
             if (filterGroup.isEmpty()) {
-                debug("Filter group '%s' not found in realm=%s. Skipping target=%s for user=%s.",
+                LOG.debugf("Filter group '%s' not found in realm=%s. Skipping target=%s for user=%s.",
                         groupName, realm.getName(), target.getName(), user.getUsername());
                 continue;
             }
@@ -134,7 +135,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
             boolean isMemberNow = user.getGroupsStream().anyMatch(g -> groupId.equals(g.getId()));
             Optional<MembershipState> existing = MembershipState.findForComponent(currentValues, target.getId());
 
-            debug("Target=%s (id=%s) filterGroup='%s' (id=%s) isMemberNow=%s existingEntry=%s user=%s",
+            LOG.debugf("Target=%s (id=%s) filterGroup='%s' (id=%s) isMemberNow=%s existingEntry=%s user=%s",
                     target.getName(), target.getId(), groupName, groupId, isMemberNow,
                     existing.map(MembershipState::toValue).orElse("<none>"),
                     user.getUsername());
@@ -143,7 +144,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                 MembershipState newState = new MembershipState(target.getId(), groupId, MembershipState.State.NEW_ADDED);
                 currentValues.add(newState.toValue());
                 changed = true;
-                info("MARK NEW_ADDED user=%s target=%s group='%s' (id=%s)",
+                LOG.infof("MARK NEW_ADDED user=%s target=%s group='%s' (id=%s)",
                         user.getUsername(), target.getName(), groupName, groupId);
 
             } else if (isMemberNow && existing.isPresent()
@@ -157,7 +158,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                 MembershipState newState = new MembershipState(target.getId(), groupId, MembershipState.State.NEW_ADDED);
                 currentValues.add(newState.toValue());
                 changed = true;
-                info("CANCEL NEW_DELETED -> MARK NEW_ADDED user=%s target=%s group='%s' (id=%s) (was %s)",
+                LOG.infof("CANCEL NEW_DELETED -> MARK NEW_ADDED user=%s target=%s group='%s' (id=%s) (was %s)",
                         user.getUsername(), target.getName(), groupName, groupId, old.state());
 
             } else if (!isMemberNow && existing.isPresent()
@@ -167,23 +168,23 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                 MembershipState newState = new MembershipState(target.getId(), groupId, MembershipState.State.NEW_DELETED);
                 currentValues.add(newState.toValue());
                 changed = true;
-                info("MARK NEW_DELETED user=%s target=%s group='%s' (id=%s) (was %s)",
+                LOG.infof("MARK NEW_DELETED user=%s target=%s group='%s' (id=%s) (was %s)",
                         user.getUsername(), target.getName(), groupName, groupId, old.state());
 
             } else if (isMemberNow && existing.isPresent()
                     && existing.get().state() == MembershipState.State.SENT) {
                 // No-op: user is in group and membership is already confirmed as SENT.
-                debug("No-op (already SENT) user=%s target=%s group='%s'",
+                LOG.debugf("No-op (already SENT) user=%s target=%s group='%s'",
                         user.getUsername(), target.getName(), groupName);
 
             } else if (!isMemberNow && existing.isEmpty()) {
                 // No-op: user is not in group and has never been tracked for this target.
-                debug("No-op (not member, no entry) user=%s target=%s group='%s'",
+                LOG.debugf("No-op (not member, no entry) user=%s target=%s group='%s'",
                         user.getUsername(), target.getName(), groupName);
 
             } else {
                 // Catch-all: log whatever unexpected combination was encountered.
-                debug("No state transition needed for user=%s target=%s (isMemberNow=%s existing=%s)",
+                LOG.debugf("No state transition needed for user=%s target=%s (isMemberNow=%s existing=%s)",
                         user.getUsername(), target.getName(), isMemberNow,
                         existing.map(MembershipState::state).orElse(null));
             }
@@ -193,7 +194,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
             List<String> pendingValues = computePendingValues(currentValues, scimTargets);
             persistTrackingAttributes(realm, user, currentValues, pendingValues);
         } else {
-            debug("No attribute changes for user=%s.", user.getUsername());
+            LOG.debugf("No attribute changes for user=%s.", user.getUsername());
         }
 
         // Group-side write path: update GroupMembershipState for each in-scope group.
@@ -239,7 +240,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                             target.getId(), user.getId(), GroupMembershipState.State.NEW_ADDED);
                     stateValues.add(newEntry.toValue());
                     groupChanged = true;
-                    info("GROUP MARK NEW_ADDED user=%s target=%s group='%s'",
+                    LOG.infof("GROUP MARK NEW_ADDED user=%s target=%s group='%s'",
                             user.getUsername(), target.getName(), group.getName());
 
                 } else if (isInGroupNow && existing.isPresent()
@@ -251,7 +252,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                             target.getId(), user.getId(), GroupMembershipState.State.NEW_ADDED);
                     stateValues.add(newEntry.toValue());
                     groupChanged = true;
-                    info("GROUP CANCEL NEW_DELETED -> MARK NEW_ADDED user=%s target=%s group='%s' (was %s)",
+                    LOG.infof("GROUP CANCEL NEW_DELETED -> MARK NEW_ADDED user=%s target=%s group='%s' (was %s)",
                             user.getUsername(), target.getName(), group.getName(), existing.get().state());
 
                 } else if (!isInGroupNow && existing.isPresent()
@@ -261,29 +262,29 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                             target.getId(), user.getId(), GroupMembershipState.State.NEW_DELETED);
                     stateValues.add(newEntry.toValue());
                     groupChanged = true;
-                    info("GROUP MARK NEW_DELETED user=%s target=%s group='%s' (was %s)",
+                    LOG.infof("GROUP MARK NEW_DELETED user=%s target=%s group='%s' (was %s)",
                             user.getUsername(), target.getName(), group.getName(), existing.get().state());
 
                 } else if (isInGroupNow && existing.isPresent()
                         && existing.get().state() == GroupMembershipState.State.SENT) {
                     // No-op: user is in group and membership is already confirmed as SENT.
-                    debug("GROUP no-op (already SENT) user=%s target=%s group='%s'",
+                    LOG.debugf("GROUP no-op (already SENT) user=%s target=%s group='%s'",
                             user.getUsername(), target.getName(), group.getName());
 
                 } else if (!isInGroupNow && existing.isPresent()
                         && existing.get().state() == GroupMembershipState.State.NEW_DELETED) {
                     // No-op: user is not in group and removal is already pending.
-                    debug("GROUP no-op (already NEW_DELETED) user=%s target=%s group='%s'",
+                    LOG.debugf("GROUP no-op (already NEW_DELETED) user=%s target=%s group='%s'",
                             user.getUsername(), target.getName(), group.getName());
 
                 } else if (!isInGroupNow && existing.isEmpty()) {
                     // No-op: user is not in group and was never tracked for this target.
-                    debug("GROUP no-op (not in group, no entry) user=%s target=%s group='%s'",
+                    LOG.debugf("GROUP no-op (not in group, no entry) user=%s target=%s group='%s'",
                             user.getUsername(), target.getName(), group.getName());
 
                 } else {
                     // Catch-all: log whatever unexpected combination was encountered.
-                    debug("GROUP unexpected state combination for user=%s target=%s group='%s' (isInGroupNow=%s existing=%s)",
+                    LOG.debugf("GROUP unexpected state combination for user=%s target=%s group='%s' (isInGroupNow=%s existing=%s)",
                             user.getUsername(), target.getName(), group.getName(), isInGroupNow,
                             existing.map(GroupMembershipState::state).orElse(null));
                 }
@@ -308,7 +309,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
                     group.setAttribute(GroupMembershipState.ATTRIBUTE_NAME, stateValues);
                     group.setAttribute(GroupMembershipState.PENDING_ATTRIBUTE_NAME, allPending);
-                    debug("Persisted group state: group='%s' target=%s membershipState=%s pending=%s",
+                    LOG.debugf("Persisted group state: group='%s' target=%s membershipState=%s pending=%s",
                             group.getName(), target.getName(), stateValues, allPending);
                 }
             }
@@ -347,7 +348,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                         try {
                             return g.getName() != null && g.getName().matches(filter);
                         } catch (java.util.regex.PatternSyntaxException e) {
-                            err("Invalid CFG_SYNC_GROUPS_FILTER regex '%s': %s", filter, e.getMessage());
+                            LOG.errorf("Invalid CFG_SYNC_GROUPS_FILTER regex '%s': %s", filter, e.getMessage());
                             return false;
                         }
                     })
@@ -401,11 +402,11 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
             // happen since the user must already be imported locally to be enumerated
             // here). Try the delegate directly as a last resort; if the store really is
             // read-only this will throw, and we at least log why.
-            info("Could not resolve local storage user for id=%s (username=%s); attempting direct setAttribute as fallback.",
+            LOG.infof("Could not resolve local storage user for id=%s (username=%s); attempting direct setAttribute as fallback.",
                     user.getId(), user.getUsername());
             user.setAttribute(MembershipState.ATTRIBUTE_NAME, stateValues);
             user.setAttribute(MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues);
-            info("Persisted attributes '%s'=%s and '%s'=%s for user=%s (via federated delegate fallback)",
+            LOG.infof("Persisted attributes '%s'=%s and '%s'=%s for user=%s (via federated delegate fallback)",
                     MembershipState.ATTRIBUTE_NAME, stateValues,
                     MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues,
                     user.getUsername());
@@ -413,7 +414,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
         }
         localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, stateValues);
         localUser.setAttribute(MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues);
-        info("Persisted attributes '%s'=%s and '%s'=%s for user=%s (via local storage)",
+        LOG.infof("Persisted attributes '%s'=%s and '%s'=%s for user=%s (via local storage)",
                 MembershipState.ATTRIBUTE_NAME, stateValues,
                 MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues,
                 user.getUsername());
@@ -482,12 +483,12 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                 .toList();
 
         if (scimTargets.isEmpty()) {
-            debug("No SCIM outbound targets configured in realm=%s. Skipping sweep.", realm.getName());
+            LOG.debugf("No SCIM outbound targets configured in realm=%s. Skipping sweep.", realm.getName());
             return new SynchronizationResult();
         }
 
         Map<String, UserModel> candidates = buildCandidateUsers(realm, scimTargets);
-        info("syncDataFromFederationProviderToKeycloak fired for realm=%s -- checking %d targeted candidate(s) instead of full realm scan.",
+        LOG.infof("syncDataFromFederationProviderToKeycloak fired for realm=%s -- checking %d targeted candidate(s) instead of full realm scan.",
                 realm.getName(), candidates.size());
 
         int usersChecked = 0;
@@ -495,7 +496,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
             usersChecked++;
             checkAndUpdateMembership(realm, user);
         }
-        info("Targeted membership check done for realm=%s: usersChecked=%d", realm.getName(), usersChecked);
+        LOG.infof("Targeted membership check done for realm=%s: usersChecked=%d", realm.getName(), usersChecked);
         return new SynchronizationResult();
     }
 
@@ -579,23 +580,5 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
     @Override
     public SynchronizationResult syncDataFromKeycloakToFederationProvider(RealmModel realm) {
         return new SynchronizationResult();
-    }
-
-    /* ===== logging ===== */
-
-    private static void debug(String fmt, Object... args) {
-        System.out.printf("%s %s DEBUG %s%n", now(), LOG_TAG, String.format(fmt, args));
-    }
-
-    private static void info(String fmt, Object... args) {
-        System.out.printf("%s %s INFO %s%n", now(), LOG_TAG, String.format(fmt, args));
-    }
-
-    private static void err(String fmt, Object... args) {
-        System.out.printf("%s %s ERROR %s%n", now(), LOG_TAG, String.format(fmt, args));
-    }
-
-    private static String now() {
-        return java.time.OffsetDateTime.now().toString();
     }
 }
