@@ -175,10 +175,16 @@ class ScimMembershipSyncStateTest {
         when(client.findUserIdByExternalId(USER_ID)).thenReturn(Optional.of(SCIM_UID));
         when(client.patchUser(eq(SCIM_UID), any())).thenReturn(true);
 
-        // previously-SENT search returns nobody
+        // processFullUserSync now issues two attribute-value searches for the deprovision
+        // candidate set: one for SENT and one for NEW_DELETED. Both must be stubbed so
+        // Mockito strict-stub mode does not raise an UnsatisfiedStubbingException.
         String sentValue = new MembershipState(TARGET_ID, GROUP_ID, SENT).toValue();
+        String newDeletedValue = new MembershipState(TARGET_ID, GROUP_ID, NEW_DELETED).toValue();
         when(localUserProvider.searchForUserByUserAttributeStream(realm,
                 MembershipState.ATTRIBUTE_NAME, sentValue))
+                .thenAnswer(inv -> Stream.empty());
+        when(localUserProvider.searchForUserByUserAttributeStream(realm,
+                MembershipState.ATTRIBUTE_NAME, newDeletedValue))
                 .thenAnswer(inv -> Stream.empty());
 
         when(user.getAttributeStream(MembershipState.ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
@@ -197,7 +203,7 @@ class ScimMembershipSyncStateTest {
     }
 
     // -------------------------------------------------------------------------
-    // Full sync -- deprovisioned user entry removed entirely
+    // Full sync -- deprovisioned user (SENT state) entry removed entirely
     // -------------------------------------------------------------------------
 
     @Test
@@ -207,11 +213,17 @@ class ScimMembershipSyncStateTest {
         // No current members
         when(userProvider.getGroupMembersStream(realm, filterGroup)).thenAnswer(inv -> Stream.empty());
 
-        // Previously SENT user no longer in group
+        // Previously SENT user no longer in group.
+        // processFullUserSync now also searches for NEW_DELETED; stub it to return empty
+        // so Mockito strict-stub mode does not raise an UnsatisfiedStubbingException.
         String sentValue = new MembershipState(TARGET_ID, GROUP_ID, SENT).toValue();
+        String newDeletedValue = new MembershipState(TARGET_ID, GROUP_ID, NEW_DELETED).toValue();
         when(localUserProvider.searchForUserByUserAttributeStream(realm,
                 MembershipState.ATTRIBUTE_NAME, sentValue))
                 .thenAnswer(inv -> Stream.of(user));
+        when(localUserProvider.searchForUserByUserAttributeStream(realm,
+                MembershipState.ATTRIBUTE_NAME, newDeletedValue))
+                .thenAnswer(inv -> Stream.empty());
 
         when(client.findUserIdByExternalId(USER_ID)).thenReturn(Optional.of(SCIM_UID));
         when(client.patchUser(eq(SCIM_UID), any())).thenReturn(true); // deactivate
@@ -230,6 +242,58 @@ class ScimMembershipSyncStateTest {
         boolean hasTarget1 = written.stream().map(MembershipState::parse).filter(Optional::isPresent)
                 .map(Optional::get).anyMatch(e -> e.componentId().equals(TARGET_ID));
         assertFalse(hasTarget1, "SENT entry must be removed entirely after successful deprovision");
+    }
+
+    // -------------------------------------------------------------------------
+    // Full sync -- user in NEW_DELETED state is still deprovisioned
+    //
+    // Regression test for: processFullUserSync previously searched only for the
+    // exact SENT attribute value. If LdapSyncNotifierMapper ran first during
+    // "Synchronize all users" and already transitioned the entry to NEW_DELETED,
+    // the SENT search returned nothing and the deprovision was silently skipped.
+    // The fix (Option A) adds a second search for NEW_DELETED so both cases are
+    // handled by the same deprovision loop.
+    // -------------------------------------------------------------------------
+
+    @Test
+    void fullSync_newDeletedUser_isDeprovisioned() {
+        when(groupProvider.searchForGroupByNameStream(eq(realm), eq("filter-grp"), eq(true), isNull(), isNull()))
+                .thenAnswer(inv -> Stream.of(filterGroup));
+        // User is no longer in the filter group
+        when(userProvider.getGroupMembersStream(realm, filterGroup)).thenAnswer(inv -> Stream.empty());
+
+        // Mapper already transitioned the entry to NEW_DELETED before full sync ran.
+        // The SENT search must return nothing; the NEW_DELETED search returns the user.
+        String sentValue = new MembershipState(TARGET_ID, GROUP_ID, SENT).toValue();
+        String newDeletedValue = new MembershipState(TARGET_ID, GROUP_ID, NEW_DELETED).toValue();
+        when(localUserProvider.searchForUserByUserAttributeStream(realm,
+                MembershipState.ATTRIBUTE_NAME, sentValue))
+                .thenAnswer(inv -> Stream.empty());
+        when(localUserProvider.searchForUserByUserAttributeStream(realm,
+                MembershipState.ATTRIBUTE_NAME, newDeletedValue))
+                .thenAnswer(inv -> Stream.of(user));
+
+        when(client.findUserIdByExternalId(USER_ID)).thenReturn(Optional.of(SCIM_UID));
+        when(client.patchUser(eq(SCIM_UID), any())).thenReturn(true); // deactivate
+
+        when(user.getAttributeStream(MembershipState.ATTRIBUTE_NAME))
+                .thenAnswer(inv -> Stream.of(newDeletedValue));
+        when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
+        when(localUserProvider.getUserById(realm, USER_ID)).thenReturn(localUser);
+        lenient().when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
+
+        ScimMembershipSync.processFullUserSync(session, realm, TARGET_ID);
+
+        // Deprovision must have been called
+        verify(client).patchUser(eq(SCIM_UID), any());
+
+        // State entry must be removed entirely after successful deprovision
+        ArgumentCaptor<List> captor = ArgumentCaptor.forClass(List.class);
+        verify(localUser, atLeastOnce()).setAttribute(eq(MembershipState.ATTRIBUTE_NAME), captor.capture());
+        List<String> written = captor.getValue();
+        boolean hasTarget1 = written.stream().map(MembershipState::parse).filter(Optional::isPresent)
+                .map(Optional::get).anyMatch(e -> e.componentId().equals(TARGET_ID));
+        assertFalse(hasTarget1, "NEW_DELETED entry must be removed entirely after successful deprovision");
     }
 
     // -------------------------------------------------------------------------
