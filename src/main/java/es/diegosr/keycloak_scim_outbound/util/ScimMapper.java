@@ -149,18 +149,26 @@ public final class ScimMapper {
      *   REMOVE_FORM_RFC_PATH_FILTER (default):
      *     {"op":"remove","path":"members[value eq \"<id>\"]"}
      *
+     *     The member ID is escaped at two levels:
+     *       1. SCIM filter literal  -- escFilter() escapes " and \ so the filter
+     *          expression is syntactically valid after JSON decoding.
+     *       2. JSON string          -- the outer esc() makes the already-escaped
+     *          filter fragment safe inside the JSON "path" string value.
+     *     Both levels are applied via escFilter() = esc(esc(id)).
+     *
      *   REMOVE_FORM_NON_RFC_VALUE_ARRAY:
      *     {"op":"remove","path":"members","value":[{"value":"<id>"}]}
+     *     The ID is embedded directly in a JSON string value; a single esc() suffices.
      *
      * @param op         "add" or "remove"
      * @param memberId   SCIM user id of the member
      * @param removeForm one of the REMOVE_FORM_* constants; ignored when op is "add"
      */
     public static String buildGroupMemberPatch(String op, String memberId, String removeForm) {
-        final String id = esc(nvl(memberId));
 
         if ("remove".equals(op)) {
             if (REMOVE_FORM_NON_RFC_VALUE_ARRAY.equals(removeForm)) {
+                final String id = esc(nvl(memberId));
                 return """
                         {
                           "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
@@ -171,8 +179,9 @@ public final class ScimMapper {
                         """.formatted(id);
             }
             // RFC 7644 path filter form (default).
-            // The escaped quote inside the filter is a JSON string escape (\"), not a
-            // Java source escape -- text blocks handle the surrounding quoting cleanly.
+            // escFilter() applies esc() twice: once for the SCIM filter string literal
+            // and once for the enclosing JSON string value of "path".
+            final String filterId = escFilter(nvl(memberId));
             return """
                     {
                       "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
@@ -180,10 +189,11 @@ public final class ScimMapper {
                         {"op":"remove","path":"members[value eq \\"%s\\"]"}
                       ]
                     }
-                    """.formatted(id);
+                    """.formatted(filterId);
         }
 
         // "add"
+        final String id = esc(nvl(memberId));
         return """
                 {
                   "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
@@ -277,6 +287,26 @@ public final class ScimMapper {
             }
         }
         return out.toString();
+    }
+
+    /**
+     * Escape a member ID for embedding inside a SCIM filter string literal that
+     * is itself embedded inside a JSON string value.
+     *
+     * Two escaping passes are required:
+     *   Pass 1 (inner) -- esc() makes the raw ID safe as a SCIM filter literal
+     *                     (e.g. a double-quote becomes \", a backslash becomes \\).
+     *   Pass 2 (outer) -- esc() again makes the already-escaped fragment safe
+     *                     inside the enclosing JSON string value of "path"
+     *                     (e.g. the \" from pass 1 becomes \\\", the \\ becomes \\\\).
+     *
+     * After a JSON parser decodes the "path" string the result of pass 1 is
+     * recovered, giving a syntactically valid SCIM filter expression.
+     *
+     * Only used for the RFC 7644 path-filter remove form.
+     */
+    private static String escFilter(String s) {
+        return esc(esc(nvl(s)));
     }
 
     /** Converts null to empty string. */
