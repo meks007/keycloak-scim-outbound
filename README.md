@@ -72,51 +72,13 @@ Once deployed:
 | **userName Strategy** | How to build SCIM `userName` (`username`, `email`, or `attribute`) | ✅ |
 | **userName Attribute** | Custom user attribute name, only if strategy = `attribute` | ❌ |
 | **Deprovision Action** | What to do on delete or group removal: `deactivate` (PATCH `active=false`, default) or `delete` (`DELETE /Users/{id}`) | ✅ |
-| **Lookup Strategy** | How to resolve SCIM user and group IDs: `externalId first` (default) or `name only` | ✅ |
+| **Lookup Strategy** | How to resolve SCIM user and group IDs: `externalId first` (default) or `name only`. Currently only applies to **LDAP**.| ✅ |
+| **Group Member Remove Form** | SCIM PATCH format for removing a group member: `RFC 7644 path filter` (default) or `Non-RFC value array`. Currently only applies to **LDAP**. | ✅ |
 | **Sync Groups** | Enable SCIM `/Groups` sync. Group create/rename/delete and membership changes are pushed to the SCIM target. Disabled by default. | ❌ |
 | **Sync Groups Filter** | Comma-delimited list for group names to include, e.g. `admins,developers,team-engineering`. Leave blank to scope group sync to *Filter Group* only. | ❌ |
 | **Use Regex for Group Filter** | Enable to use Java regex patterns for group filter, e.g. `admins\|developers\|team-.*`. | ❌ |
 | **LDAP Users Provisioning Mode** | How LDAP-driven user sync runs on *Synchronize changed users*: `Delta` (default) or `Full` | ✅ |
 | **LDAP Groups Provisioning Mode** | How LDAP-driven group sync runs on *Synchronize changed users*: `Delta (add members)` (default), `Delta (add and remove members)`, or `Full` | ✅ |
-| **Group Member Remove Form** | SCIM PATCH format for removing a group member: `RFC 7644 path filter` (default) or `Non-RFC value array` | ✅ |
-
-### Lookup Strategy
-
-The **Lookup Strategy** applies to both `/Users` and `/Groups`:
-
-- **`externalId first`** — Query by `externalId` first. If exactly one result is returned, use it. If no result or multiple results are returned, fall back to `userName` for users or `displayName` for groups.
-- **`name only`** — Skip the `externalId` request and resolve users by `userName` and groups by `displayName`.
-
-Use `name only` when the SCIM server ignores the `externalId` filter and returns an unfiltered list.
-
-### Group Member Remove Form
-
-When removing a member from a SCIM group, the plugin supports two payload formats:
-
-- **`RFC 7644 path filter`** — The spec-compliant form:
-
-  ```json
-  {
-    "op": "remove",
-    "path": "members[value eq \"<id>\"]"
-  }
-  ```
-
-- **`Non-RFC value array`** — A compatibility form for servers that require a `value` field on every operation:
-
-  ```json
-  {
-    "op": "remove",
-    "path": "members",
-    "value": [
-      {
-        "value": "<id>"
-      }
-    ]
-  }
-  ```
-
----
 
 ## 🔄 Supported Events
 
@@ -131,8 +93,6 @@ When removing a member from a SCIM group, the plugin supports two payload format
 | **Group CREATE/UPDATE/DELETE** | Create, rename, or delete the corresponding SCIM group when `Sync Groups` is enabled |
 
 > ℹ️ **Lifecycle lookup and deprovisioning:** users are matched by SCIM `externalId` (the Keycloak user id) first, falling back to `userName` for users provisioned before `externalId` existed. The `externalId` is also backfilled on update for legacy users. Deprovisioning defaults to **deactivate** (`PATCH active=false`); set *Deprovision Action* to `delete` for providers that require a hard delete, such as VMware vCenter.
-
----
 
 ## 🗂️ SCIM Group Sync
 
@@ -173,7 +133,47 @@ Each synchronization sweep runs in three steps:
 
 This means changing the **Sync Groups Filter (regex)** can remove remote groups from the previous scope on the next synchronization sweep. A group is deleted only after it is determined to be outside the current scope for that target.
 
-### Provisioning modes
+## Lookup Strategy
+
+> **Note:** Lookup Strategy currently applies to LDAP-driven synchronization, while the event-driven path continues to use its existing lookup behavior.
+
+The **Lookup Strategy** applies to both `/Users` and `/Groups`:
+
+- **`externalId first`** — Query by `externalId` first. If exactly one result is returned, use it. If no result or multiple results are returned, fall back to `userName` for users or `displayName` for groups.
+- **`name only`** — Skip the `externalId` request and resolve users by `userName` and groups by `displayName`.
+
+Use `name only` when the SCIM server ignores the `externalId` filter and returns an unfiltered list.
+
+## Group Member Remove Form
+
+> **Note:** Group Member Remove Form currently applies to LDAP-driven synchronization ONLY, while the event-driven path continues to use the default RFC removal form.
+
+When removing a member from a SCIM group, the plugin supports two payload formats:
+
+- **`RFC 7644 path filter`** — The spec-compliant form:
+
+  ```json
+  {
+    "op": "remove",
+    "path": "members[value eq \"<id>\"]"
+  }
+  ```
+
+- **`Non-RFC value array`** — A compatibility form for servers that require a `value` field on every operation:
+
+  ```json
+  {
+    "op": "remove",
+    "path": "members",
+    "value": [
+      {
+        "value": "<id>"
+      }
+    ]
+  }
+  ```
+
+## Provisioning modes
 
 The **LDAP Users Provisioning Mode** and **LDAP Groups Provisioning Mode** settings control *Synchronize changed users*.
 
@@ -188,7 +188,7 @@ The **LDAP Users Provisioning Mode** and **LDAP Groups Provisioning Mode** setti
 
 The `Delta (add and remove members)` mode performs an additional cross-check after flushing pending changes. Members that still exist remotely but are no longer present in the local Keycloak group are removed from the SCIM group. Keycloak remains the source of truth; the cross-check does not add missing members or create groups.
 
-### Provisioning scope
+## Provisioning scope
 
 - **User provisioning** is scoped to members of *Filter Group*.
 - **Event-driven group sync** applies to groups matching the *Sync Groups Filter* regex, or to *Filter Group* when the filter is blank.
@@ -198,7 +198,7 @@ The `Delta (add and remove members)` mode performs an additional cross-check aft
 - LDAP-driven group creation is performed only for groups in scope for the configured target.
 - Remote groups that leave the current scope are deleted by the deprovision sweep, including groups affected by a changed scope filter.
 
-### Limitations
+## Limitations
 
 - **No retroactive processing without a sync:** enabling *Sync Groups* does not itself run a sync. Run **Synchronize all users** on the SCIM outbound provider after enabling if existing LDAP groups and their current members should be sent immediately.
 - **Out-of-scope cleanup requires a synchronization sweep:** a deleted group or a group that no longer matches the filter is removed remotely when the provider's synchronization sweep runs. It is not removed merely by changing the configuration.
